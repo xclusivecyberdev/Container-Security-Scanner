@@ -1,0 +1,154 @@
+# GitHub Actions workflow for Docker Security Scanning
+name: Docker Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Docker Security Scanner
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Build Docker image
+        run: |
+          docker build -t myapp:latest .
+
+      - name: Run security scan
+        id: scan
+        run: |
+          python -m cli.main scan-image myapp:latest \
+            --format json \
+            --output scan-results.json \
+            --severity MEDIUM
+        continue-on-error: true
+
+      - name: Check for critical vulnerabilities
+        run: |
+          CRITICAL=$(jq '.summary.CRITICAL' scan-results.json)
+          HIGH=$(jq '.summary.HIGH' scan-results.json)
+
+          echo "Critical vulnerabilities: $CRITICAL"
+          echo "High vulnerabilities: $HIGH"
+
+          # Fail if critical vulnerabilities found
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "❌ Critical vulnerabilities found! Build failed."
+            exit 1
+          fi
+
+          # Warn if high vulnerabilities found
+          if [ "$HIGH" -gt 5 ]; then
+            echo "⚠️  More than 5 high vulnerabilities found!"
+            exit 1
+          fi
+
+      - name: Generate HTML report
+        if: always()
+        run: |
+          python -m cli.main scan-image myapp:latest \
+            --format html \
+            --output security-report.html
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-scan-results
+          path: |
+            scan-results.json
+            security-report.html
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('scan-results.json', 'utf8'));
+
+            const summary = results.summary;
+            const totalIssues = Object.values(summary).reduce((a, b) => a + b, 0);
+
+            const comment = `
+            ## 🔒 Docker Security Scan Results
+
+            **Image:** myapp:latest
+            **Total Issues:** ${totalIssues}
+
+            | Severity | Count |
+            |----------|-------|
+            | 🔴 Critical | ${summary.CRITICAL} |
+            | 🟠 High | ${summary.HIGH} |
+            | 🟡 Medium | ${summary.MEDIUM} |
+            | 🔵 Low | ${summary.LOW} |
+            | ⚪ Info | ${summary.INFO} |
+
+            ${summary.CRITICAL > 0 ? '⚠️ **Action required:** Critical vulnerabilities detected!' : ''}
+            ${summary.HIGH > 5 ? '⚠️ **Warning:** Multiple high-severity issues found!' : ''}
+
+            [View detailed report](https://github.com/${{github.repository}}/actions/runs/${{github.run_id}})
+            `;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+  container-scan:
+    runs-on: ubuntu-latest
+    needs: security-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and load image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: myapp:${{ github.sha }}
+
+      - name: Run container scan
+        run: |
+          docker run -d --name myapp-test myapp:${{ github.sha }}
+          sleep 5
+          python -m cli.main scan-container myapp-test \
+            --format json \
+            --output container-scan.json
+          docker stop myapp-test || true
+          docker rm myapp-test || true
+
+      - name: Upload container scan results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: container-scan-results
+          path: container-scan.json

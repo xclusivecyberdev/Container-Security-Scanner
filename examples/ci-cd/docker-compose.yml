@@ -1,0 +1,38 @@
+# Docker Compose for running security scanner dashboard
+
+version: '3.8'
+
+services:
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dashboard
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./reports:/app/reports
+    environment:
+      - FLASK_APP=src.dashboard.app
+      - FLASK_ENV=development
+    networks:
+      - scanner-network
+
+  scanner-api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scan-results:/app/results
+    command: python -m cli.main --help
+    networks:
+      - scanner-network
+
+networks:
+  scanner-network:
+    driver: bridge
+
+volumes:
+  reports:
+  scan-results:

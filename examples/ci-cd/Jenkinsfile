@@ -1,0 +1,218 @@
+// Jenkins Pipeline for Docker Security Scanning
+
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "myapp:${env.BUILD_NUMBER}"
+        SCAN_RESULTS = "scan-results.json"
+        HTML_REPORT = "security-report.html"
+        PDF_REPORT = "security-report.pdf"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                script {
+                    sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements.txt
+                        pip install -e .
+                    '''
+                }
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                script {
+                    sh "docker build -t ${IMAGE_NAME} ."
+                }
+            }
+        }
+
+        stage('Security Scan - Image') {
+            steps {
+                script {
+                    sh """
+                        . venv/bin/activate
+                        python -m cli.main scan-image ${IMAGE_NAME} \
+                            --format json \
+                            --output ${SCAN_RESULTS} \
+                            --severity LOW
+                    """
+                }
+            }
+        }
+
+        stage('Analyze Results') {
+            steps {
+                script {
+                    def scanResults = readJSON file: SCAN_RESULTS
+                    def summary = scanResults.summary
+
+                    echo "Security Scan Summary:"
+                    echo "Critical: ${summary.CRITICAL}"
+                    echo "High: ${summary.HIGH}"
+                    echo "Medium: ${summary.MEDIUM}"
+                    echo "Low: ${summary.LOW}"
+                    echo "Info: ${summary.INFO}"
+
+                    // Set build status
+                    if (summary.CRITICAL > 0) {
+                        currentBuild.result = 'FAILURE'
+                        error("Critical vulnerabilities found: ${summary.CRITICAL}")
+                    } else if (summary.HIGH > 10) {
+                        currentBuild.result = 'UNSTABLE'
+                        echo "Warning: Multiple high-severity vulnerabilities found: ${summary.HIGH}"
+                    }
+
+                    // Store metrics
+                    env.CRITICAL_COUNT = summary.CRITICAL
+                    env.HIGH_COUNT = summary.HIGH
+                    env.MEDIUM_COUNT = summary.MEDIUM
+                }
+            }
+        }
+
+        stage('Generate Reports') {
+            steps {
+                script {
+                    sh """
+                        . venv/bin/activate
+
+                        # Generate HTML report
+                        python -m cli.main scan-image ${IMAGE_NAME} \
+                            --format html \
+                            --output ${HTML_REPORT}
+
+                        # Generate PDF report
+                        python -m cli.main scan-image ${IMAGE_NAME} \
+                            --format pdf \
+                            --output ${PDF_REPORT}
+                    """
+                }
+            }
+        }
+
+        stage('Security Scan - Container') {
+            steps {
+                script {
+                    sh """
+                        # Start container
+                        docker run -d --name test-${BUILD_NUMBER} ${IMAGE_NAME} sleep 3600
+
+                        # Scan container
+                        . venv/bin/activate
+                        python -m cli.main scan-container test-${BUILD_NUMBER} \
+                            --format json \
+                            --output container-scan.json || true
+
+                        # Stop and remove container
+                        docker stop test-${BUILD_NUMBER} || true
+                        docker rm test-${BUILD_NUMBER} || true
+                    """
+                }
+            }
+        }
+
+        stage('Publish Reports') {
+            steps {
+                publishHTML([
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: '.',
+                    reportFiles: HTML_REPORT,
+                    reportName: 'Security Scan Report',
+                    reportTitles: 'Docker Security Scan'
+                ])
+
+                archiveArtifacts artifacts: "${SCAN_RESULTS},${HTML_REPORT},${PDF_REPORT},container-scan.json",
+                                 allowEmptyArchive: true,
+                                 fingerprint: true
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    if (env.CRITICAL_COUNT.toInteger() > 0) {
+                        error("Quality Gate Failed: Critical vulnerabilities detected")
+                    }
+
+                    if (env.HIGH_COUNT.toInteger() > 15) {
+                        unstable("Quality Gate Warning: Too many high-severity issues")
+                    }
+                }
+            }
+        }
+
+        stage('Push to Registry') {
+            when {
+                branch 'main'
+                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
+            }
+            steps {
+                script {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-registry',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh """
+                            echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
+                            docker tag ${IMAGE_NAME} myregistry.com/${IMAGE_NAME}
+                            docker push myregistry.com/${IMAGE_NAME}
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Clean up
+            sh """
+                docker rmi ${IMAGE_NAME} || true
+                rm -rf venv
+            """
+        }
+
+        success {
+            echo "✅ Security scan passed successfully!"
+            slackSend(
+                color: 'good',
+                message: "Security Scan Passed: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nCritical: ${env.CRITICAL_COUNT}, High: ${env.HIGH_COUNT}"
+            )
+        }
+
+        failure {
+            echo "❌ Security scan failed!"
+            slackSend(
+                color: 'danger',
+                message: "Security Scan Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nCritical: ${env.CRITICAL_COUNT}, High: ${env.HIGH_COUNT}"
+            )
+        }
+
+        unstable {
+            echo "⚠️ Security scan completed with warnings"
+            slackSend(
+                color: 'warning',
+                message: "Security Scan Warning: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nHigh severity issues: ${env.HIGH_COUNT}"
+            )
+        }
+    }
+}
+
+// Scheduled security scan
+// Configure in Jenkins: H 2 * * * (daily at 2 AM)

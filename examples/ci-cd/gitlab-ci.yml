@@ -1,0 +1,168 @@
+# GitLab CI/CD pipeline for Docker Security Scanning
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+stages:
+  - build
+  - security-scan
+  - report
+  - deploy
+
+build-image:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  script:
+    - docker build -t $IMAGE_NAME .
+    - docker save $IMAGE_NAME -o image.tar
+  artifacts:
+    paths:
+      - image.tar
+    expire_in: 1 hour
+
+security-scan-image:
+  stage: security-scan
+  image: python:3.10
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  before_script:
+    - pip install -r requirements.txt
+    - pip install -e .
+    - docker load -i image.tar
+  script:
+    # Run comprehensive scan
+    - |
+      python -m cli.main scan-image $IMAGE_NAME \
+        --format json \
+        --output scan-results.json \
+        --severity LOW
+
+    # Check for critical issues
+    - |
+      CRITICAL=$(jq '.summary.CRITICAL // 0' scan-results.json)
+      HIGH=$(jq '.summary.HIGH // 0' scan-results.json)
+
+      echo "Critical vulnerabilities: $CRITICAL"
+      echo "High vulnerabilities: $HIGH"
+
+      # Create metrics for GitLab
+      echo "critical_vulnerabilities $CRITICAL" > metrics.txt
+      echo "high_vulnerabilities $HIGH" >> metrics.txt
+
+      # Fail if critical vulnerabilities found
+      if [ "$CRITICAL" -gt 0 ]; then
+        echo "❌ Critical vulnerabilities detected!"
+        exit 1
+      fi
+
+    # Generate reports
+    - |
+      python -m cli.main scan-image $IMAGE_NAME \
+        --format html \
+        --output public/security-report.html
+
+      python -m cli.main scan-image $IMAGE_NAME \
+        --format pdf \
+        --output public/security-report.pdf
+
+  artifacts:
+    when: always
+    paths:
+      - scan-results.json
+      - metrics.txt
+      - public/
+    reports:
+      metrics: metrics.txt
+    expire_in: 30 days
+  allow_failure: false
+
+security-scan-container:
+  stage: security-scan
+  image: python:3.10
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  before_script:
+    - pip install -r requirements.txt
+    - pip install -e .
+    - docker load -i image.tar
+  script:
+    # Start container
+    - docker run -d --name test-container $IMAGE_NAME sleep 3600
+
+    # Scan running container
+    - |
+      python -m cli.main scan-container test-container \
+        --format json \
+        --output container-scan.json
+
+    # Stop container
+    - docker stop test-container || true
+    - docker rm test-container || true
+
+  artifacts:
+    when: always
+    paths:
+      - container-scan.json
+    expire_in: 30 days
+  allow_failure: true
+
+generate-report:
+  stage: report
+  image: python:3.10
+  script:
+    - pip install jinja2
+    - |
+      python3 << 'EOF'
+      import json
+
+      with open('scan-results.json') as f:
+          data = json.load(f)
+
+      summary = data.get('summary', {})
+      total = sum(summary.values())
+
+      print(f"## 🔒 Security Scan Summary")
+      print(f"")
+      print(f"**Total Issues:** {total}")
+      print(f"")
+      print(f"| Severity | Count |")
+      print(f"|----------|-------|")
+      print(f"| Critical | {summary.get('CRITICAL', 0)} |")
+      print(f"| High     | {summary.get('HIGH', 0)} |")
+      print(f"| Medium   | {summary.get('MEDIUM', 0)} |")
+      print(f"| Low      | {summary.get('LOW', 0)} |")
+      print(f"| Info     | {summary.get('INFO', 0)} |")
+      EOF
+  only:
+    - merge_requests
+
+pages:
+  stage: deploy
+  script:
+    - echo "Deploying security reports to GitLab Pages"
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+
+# Scheduled security scan
+security-scan-scheduled:
+  stage: security-scan
+  extends: security-scan-image
+  only:
+    - schedules
+  allow_failure: true

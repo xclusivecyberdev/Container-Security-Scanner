@@ -1,0 +1,130 @@
+# Docker Security Scanner Configuration
+
+# Scanner settings
+scanners:
+  image_vulnerability:
+    enabled: true
+    timeout: 300
+
+  package_vulnerability:
+    enabled: true
+    timeout: 600
+    databases:
+      - nvd
+      - alpine
+      - debian
+
+  misconfiguration:
+    enabled: true
+    checks:
+      - user
+      - ports
+      - environment
+      - healthcheck
+      - volumes
+      - capabilities
+
+  secrets:
+    enabled: true
+    max_file_size: 10485760  # 10MB
+    exclude_patterns:
+      - '*.git/*'
+      - 'node_modules/*'
+      - '*.pyc'
+
+  privilege_escalation:
+    enabled: true
+    check_suid: true
+    check_sudo: true
+    check_capabilities: true
+
+  benchmark:
+    enabled: true
+    standard: cis-1.6.0
+    compliance_level: level1  # level1 or level2
+
+# Severity thresholds
+thresholds:
+  critical:
+    max_allowed: 0
+    action: fail
+
+  high:
+    max_allowed: 5
+    action: warn
+
+  medium:
+    max_allowed: 20
+    action: warn
+
+  low:
+    max_allowed: 100
+    action: info
+
+# Reporting
+reporting:
+  formats:
+    - json
+    - html
+    - pdf
+
+  output_dir: ./reports
+
+  html:
+    template: default
+    include_metadata: true
+
+  pdf:
+    page_size: letter
+    include_charts: true
+
+  json:
+    pretty_print: true
+    include_metadata: true
+
+# Notifications
+notifications:
+  slack:
+    enabled: false
+    webhook_url: ${SLACK_WEBHOOK_URL}
+    channel: #security
+
+  email:
+    enabled: false
+    smtp_server: smtp.gmail.com
+    smtp_port: 587
+    from_address: security@example.com
+    to_addresses:
+      - team@example.com
+
+# CI/CD Integration
+ci_cd:
+  fail_on_critical: true
+  fail_on_high_count: 10
+
+  github_actions:
+    comment_on_pr: true
+    upload_artifacts: true
+
+  gitlab_ci:
+    create_issues: true
+    publish_metrics: true
+
+# Advanced settings
+advanced:
+  parallel_scans: true
+  max_workers: 4
+  cache_enabled: true
+  cache_ttl: 3600  # 1 hour
+
+  # Custom vulnerability database URLs
+  custom_db_urls:
+    # - https://example.com/vuln-db.json
+
+  # Exclude specific CVEs (false positives)
+  exclude_cves:
+    # - CVE-2023-12345
+
+  # Custom patterns for secrets scanning
+  custom_secret_patterns:
+    # custom_api_key: 'CUSTOM_[A-Z0-9]{32}'
